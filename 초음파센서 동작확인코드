@@ -1,0 +1,89 @@
+#include <Arduino.h>
+
+// 센서 1, 2, 3, 4 순서
+const uint8_t ECHO_PIN[4] = {25, 32, 27, 13};
+const uint8_t TRIG_PIN[4] = {33, 18, 26, 14};
+
+// 모터 펄스는 발생시키지 않음
+const uint8_t STEP_PIN[4] = {2, 16, 5, 21};
+const uint8_t DIR_PIN[4]  = {15, 4, 17, 19};
+
+void measureAll() {
+  Serial.println("\n--- Distance test ---");
+
+  for (uint8_t i = 0; i < 4; ++i) {
+    // 센서 간 간섭을 줄이기 위해 순서대로 측정
+    delay(70);
+
+    digitalWrite(TRIG_PIN[i], LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN[i], HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN[i], LOW);
+
+    // 최대 30ms 동안 ECHO 응답 대기
+    unsigned long duration =
+        pulseIn(ECHO_PIN[i], HIGH, 30000UL);
+
+    Serial.print("Sensor ");
+    Serial.print(i + 1);
+    Serial.print(" [TRIG=");
+    Serial.print(TRIG_PIN[i]);
+    Serial.print(", ECHO=");
+    Serial.print(ECHO_PIN[i]);
+    Serial.print("]: ");
+
+    if (duration == 0) {
+      Serial.println("NO ECHO");
+      continue;
+    }
+
+    float cm = duration * 0.0343f / 2.0f;
+
+    Serial.print(cm, 1);
+    Serial.print(" cm");
+
+    if (cm < 2.0f || cm > 400.0f) {
+      Serial.print(" [OUT OF RANGE]");
+    }
+
+    Serial.println();
+  }
+
+  Serial.println("Send r to measure again.");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  for (uint8_t i = 0; i < 4; ++i) {
+    // 모터 전원은 꺼 둔 상태로 시험
+    digitalWrite(STEP_PIN[i], LOW);
+    pinMode(STEP_PIN[i], OUTPUT);
+
+    digitalWrite(DIR_PIN[i], LOW);
+    pinMode(DIR_PIN[i], OUTPUT);
+
+    digitalWrite(TRIG_PIN[i], LOW);
+    pinMode(TRIG_PIN[i], OUTPUT);
+
+    pinMode(ECHO_PIN[i], INPUT);
+  }
+
+  delay(500);
+
+  Serial.println("\nUltrasonic test: ECHO4=13, TRIG4=14");
+  Serial.println("Send r to read all 4 sensors.");
+}
+
+void loop() {
+  if (Serial.available()) {
+    char command = Serial.read();
+
+    if (command == 'r' || command == 'R') {
+      measureAll();
+    }
+  }
+
+  delay(1);
+}r
