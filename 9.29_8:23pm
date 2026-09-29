@@ -1,0 +1,553 @@
+#include <Arduino.h>
+
+// =====================================================
+// 1. 핀 설정
+// =====================================================
+
+const int NUM_LEGS = 4;
+
+// ---------- TB6600 ----------
+const int STEP_PIN[NUM_LEGS] = {
+  2,   // Motor 1
+  16,  // Motor 2
+  5,   // Motor 3
+  21   // Motor 4
+};
+
+const int DIR_PIN[NUM_LEGS] = {
+  15,  // Motor 1
+  4,   // Motor 2
+  17,  // Motor 3
+  19   // Motor 4
+};
+
+// ---------- HC-SR04 ----------
+const int TRIG_PIN[NUM_LEGS] = {
+  33,  // Sensor 1
+  18,  // Sensor 2
+  26,  // Sensor 3
+  14   // Sensor 4
+};
+
+const int ECHO_PIN[NUM_LEGS] = {
+  25,  // Sensor 1
+  32,  // Sensor 2
+  27,  // Sensor 3
+  13   // Sensor 4
+};
+
+
+// =====================================================
+// 2. 모터 설정
+// =====================================================
+
+// TB6600 = 1600 pulse / rev
+// T8 lead screw = 2 mm / rev
+// 따라서 800 pulse / mm
+const float PULSES_PER_MM = 800.0f;
+
+
+// 최대 다리 연장
+const float MAX_EXTENSION_MM = 50.0f;
+
+
+// 초음파센서 오차 때문에
+// 초기거리와 5mm 이하 차이는 무시
+const float DEAD_BAND_MM = 5.0f;
+
+
+// =====================================================
+// 3. 방향 설정
+// =====================================================
+
+// HIGH일 때 연장된다고 가정
+//
+// 만약 어떤 모터가 반대로 움직이면
+// 그 모터만 HIGH ↔ LOW 바꾸면 됨.
+
+const int EXTEND_DIR[NUM_LEGS] = {
+  HIGH,   // Motor 1
+  HIGH,   // Motor 2
+  HIGH,   // Motor 3
+  HIGH    // Motor 4
+};
+
+
+// =====================================================
+// 4. 모터 속도
+// =====================================================
+
+// mm/s
+//
+// 모터2가 뚝뚝거린다고 했으므로
+// 일단 모터2만 3mm/s로 낮춤.
+
+float MOTOR_SPEED_MM_S[NUM_LEGS] = {
+  5.0,   // Motor 1
+  3.0,   // Motor 2
+  5.0,   // Motor 3
+  5.0    // Motor 4
+};
+
+
+// STEP 주기
+unsigned long stepIntervalUs[NUM_LEGS];
+
+
+// =====================================================
+// 5. 위치 변수
+// =====================================================
+
+// 현재 모터 위치
+volatile long currentSteps[NUM_LEGS] = {
+  0, 0, 0, 0
+};
+
+
+// 초음파센서가 요구하는 목표 위치
+volatile long targetSteps[NUM_LEGS] = {
+  0, 0, 0, 0
+};
+
+
+unsigned long lastStepUs[NUM_LEGS] = {
+  0, 0, 0, 0
+};
+
+
+// =====================================================
+// 6. 초음파 거리
+// =====================================================
+
+float baseDistance[NUM_LEGS];
+volatile float currentDistance[NUM_LEGS];
+
+
+// =====================================================
+// 초음파센서 1회 측정
+// =====================================================
+
+float readDistanceMM(int sensor)
+{
+  digitalWrite(TRIG_PIN[sensor], LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN[sensor], HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN[sensor], LOW);
+
+
+  // timeout 5000 us
+  // 약 85cm 이상이면 실패 처리
+  unsigned long duration =
+    pulseIn(ECHO_PIN[sensor], HIGH, 5000);
+
+
+  if (duration == 0)
+  {
+    return -1;
+  }
+
+
+  // 음속 계산
+  float distanceMM =
+    duration * 0.343f / 2.0f;
+
+
+  return distanceMM;
+}
+
+
+// =====================================================
+// 초기 거리 측정
+// =====================================================
+
+float calibrateSensor(int sensor)
+{
+  float sum = 0;
+  int count = 0;
+
+  for (int i = 0; i < 15; i++)
+  {
+    float d = readDistanceMM(sensor);
+
+    if (d > 10 && d < 500)
+    {
+      sum += d;
+      count++;
+    }
+
+    delay(30);
+  }
+
+
+  if (count == 0)
+  {
+    return 30.0f;
+  }
+
+
+  return sum / count;
+}
+
+
+// =====================================================
+// 초음파센서 Task
+//
+// Core 0에서 실행
+//
+// 모터 STEP 생성은 Core 1에서 하기 때문에
+// pulseIn() 때문에 모터가 끊기는 현상을 감소시킴
+// =====================================================
+
+void ultrasonicTask(void *parameter)
+{
+  float filteredDistance[NUM_LEGS];
+
+
+  for (int i = 0; i < NUM_LEGS; i++)
+  {
+    filteredDistance[i] = baseDistance[i];
+  }
+
+
+  while (true)
+  {
+
+    for (int i = 0; i < NUM_LEGS; i++)
+    {
+
+      float newDistance =
+        readDistanceMM(i);
+
+
+      // 정상적인 값일 때만 사용
+      if (newDistance > 10 &&
+          newDistance < 500)
+      {
+
+        // ==========================================
+        // 간단한 Low Pass Filter
+        //
+        // 갑자기 값이 튀는 현상 감소
+        // ==========================================
+
+        filteredDistance[i] =
+          filteredDistance[i] * 0.70f
+          + newDistance * 0.30f;
+
+
+        currentDistance[i] =
+          filteredDistance[i];
+
+
+        // ==========================================
+        // 초기 거리와 현재 거리 차이
+        // ==========================================
+
+        float difference =
+          filteredDistance[i]
+          - baseDistance[i];
+
+
+        // ------------------------------------------
+        // 초기 거리 근처
+        //
+        // → 연장량 0
+        // → 기존에 연장되어 있었다면 자동 수축
+        // ------------------------------------------
+
+        if (difference <= DEAD_BAND_MM)
+        {
+          targetSteps[i] = 0;
+        }
+
+        else
+        {
+
+          // 최대 연장량 제한
+          if (difference > MAX_EXTENSION_MM)
+          {
+            difference = MAX_EXTENSION_MM;
+          }
+
+
+          // 필요한 연장 거리 → STEP 변환
+          targetSteps[i] =
+            (long)(
+              difference *
+              PULSES_PER_MM
+            );
+        }
+      }
+
+
+      // 센서 간 간섭 방지
+      delay(25);
+    }
+  }
+}
+
+
+// =====================================================
+// 모터 1개 STEP 생성
+// =====================================================
+
+void updateMotor(int motor)
+{
+
+  long target =
+    targetSteps[motor];
+
+
+  long current =
+    currentSteps[motor];
+
+
+  // 목표 위치 도달
+  if (current == target)
+  {
+    return;
+  }
+
+
+  unsigned long now =
+    micros();
+
+
+  if (
+    now - lastStepUs[motor]
+    < stepIntervalUs[motor]
+  )
+  {
+    return;
+  }
+
+
+  lastStepUs[motor] = now;
+
+
+  // =================================================
+  // 연장
+  // =================================================
+
+  if (target > current)
+  {
+
+    digitalWrite(
+      DIR_PIN[motor],
+      EXTEND_DIR[motor]
+    );
+
+
+    digitalWrite(
+      STEP_PIN[motor],
+      HIGH
+    );
+
+    delayMicroseconds(5);
+
+    digitalWrite(
+      STEP_PIN[motor],
+      LOW
+    );
+
+
+    currentSteps[motor]++;
+  }
+
+
+  // =================================================
+  // 수축
+  // =================================================
+
+  else
+  {
+
+    digitalWrite(
+      DIR_PIN[motor],
+      !EXTEND_DIR[motor]
+    );
+
+
+    digitalWrite(
+      STEP_PIN[motor],
+      HIGH
+    );
+
+    delayMicroseconds(5);
+
+    digitalWrite(
+      STEP_PIN[motor],
+      LOW
+    );
+
+
+    currentSteps[motor]--;
+  }
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+
+  Serial.begin(115200);
+
+
+  // ---------- MOTOR ----------
+
+  for (int i = 0; i < NUM_LEGS; i++)
+  {
+
+    pinMode(
+      STEP_PIN[i],
+      OUTPUT
+    );
+
+    pinMode(
+      DIR_PIN[i],
+      OUTPUT
+    );
+
+
+    digitalWrite(
+      STEP_PIN[i],
+      LOW
+    );
+
+
+    // 속도 계산
+    //
+    // 5mm/s
+    // 800 pulse/mm
+    //
+    // 4000 pulse/s
+    // = 250us / pulse
+
+    float pulsesPerSecond =
+      MOTOR_SPEED_MM_S[i]
+      * PULSES_PER_MM;
+
+
+    stepIntervalUs[i] =
+      (unsigned long)(
+        1000000.0f /
+        pulsesPerSecond
+      );
+  }
+
+
+  // ---------- SENSOR ----------
+
+  for (int i = 0; i < NUM_LEGS; i++)
+  {
+
+    pinMode(
+      TRIG_PIN[i],
+      OUTPUT
+    );
+
+    pinMode(
+      ECHO_PIN[i],
+      INPUT
+    );
+
+
+    digitalWrite(
+      TRIG_PIN[i],
+      LOW
+    );
+  }
+
+
+  delay(1000);
+
+
+  Serial.println();
+  Serial.println(
+    "===== INITIAL CALIBRATION ====="
+  );
+
+
+  // =================================================
+  // 초기 거리 저장
+  // =================================================
+
+  for (int i = 0; i < NUM_LEGS; i++)
+  {
+
+    baseDistance[i] =
+      calibrateSensor(i);
+
+
+    currentDistance[i] =
+      baseDistance[i];
+
+
+    Serial.print(
+      "Sensor "
+    );
+
+    Serial.print(
+      i + 1
+    );
+
+    Serial.print(
+      " BASE = "
+    );
+
+    Serial.print(
+      baseDistance[i]
+    );
+
+    Serial.println(
+      " mm"
+    );
+  }
+
+
+  Serial.println(
+    "===== START ====="
+  );
+
+
+  // =================================================
+  // 초음파센서 Task
+  //
+  // Core 0
+  // =================================================
+
+  xTaskCreatePinnedToCore(
+    ultrasonicTask,
+    "UltrasonicTask",
+    4096,
+    NULL,
+    1,
+    NULL,
+    0
+  );
+}
+
+
+// =====================================================
+// LOOP
+//
+// Core 1
+// 모터 STEP 전용
+// =====================================================
+
+void loop()
+{
+
+  // 4개 모터 전부 독립 제어
+
+  updateMotor(0);
+  updateMotor(1);
+  updateMotor(2);
+  updateMotor(3);
+}
