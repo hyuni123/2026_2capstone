@@ -1,0 +1,53 @@
+#include <Arduino.h>
+
+const int TRIG_PIN = 23;
+const int ECHO_PIN = 22;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  Serial.println("=== HC-SR04 DIAGNOSTIC ===");
+}
+
+void loop() {
+
+  Serial.print("ECHO before trigger = ");
+  Serial.println(digitalRead(ECHO_PIN));
+
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(5);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration =
+      pulseIn(ECHO_PIN, HIGH, 40000UL);
+
+  Serial.print("duration = ");
+  Serial.println(duration);
+
+  if (duration == 0) {
+
+    Serial.println("ERROR: ECHO pulse 없음");
+
+  } else {
+
+    float distanceCM =
+        duration * 0.0343 / 2.0;
+
+    Serial.print("Distance = ");
+    Serial.print(distanceCM);
+    Serial.println(" cm");
+  }
+
+  Serial.println("--------------------");
+
+  delay(1000);
+}
