@@ -1,83 +1,197 @@
 #include <Arduino.h>
 
-// 센서 1, 2, 3, 4 순서
-const uint8_t ECHO_PIN[4] = {25, 32, 27, 13};
-const uint8_t TRIG_PIN[4] = {33, 18, 26, 14};
+// ======================================================
+// 초음파 센서 핀
+// 사진의 최종 배선표 기준
+// ======================================================
 
-// 모터 펄스는 발생시키지 않음
-const uint8_t STEP_PIN[4] = {2, 16, 5, 21};
-const uint8_t DIR_PIN[4]  = {15, 4, 17, 19};
+// 센서 1, 2, 3, 4 순서
+const uint8_t ECHO_PIN[4] = {
+  13,   // 센서1 ECHO
+  26,   // 센서2 ECHO
+  33,   // 센서3 ECHO
+  35    // 센서4 ECHO
+};
+
+const uint8_t TRIG_PIN[4] = {
+  14,   // 센서1 TRIG
+  27,   // 센서2 TRIG
+  25,   // 센서3 TRIG
+  32    // 센서4 TRIG
+};
+
+
+// ======================================================
+// TB6600 모터 드라이버 핀
+// 모터 1, 2, 3, 4 순서
+// ======================================================
+
+const uint8_t STEP_PIN[4] = {
+  2,    // 모터1 PUL+
+  16,   // 모터2 PUL+
+  5,    // 모터3 PUL+
+  21    // 모터4 PUL+
+};
+
+const uint8_t DIR_PIN[4] = {
+  15,   // 모터1 DIR+
+  4,    // 모터2 DIR+
+  17,   // 모터3 DIR+
+  19    // 모터4 DIR+
+};
+
+
+// ======================================================
+// 초음파 센서 하나 측정
+// ======================================================
+
+float readDistance(uint8_t trigPin, uint8_t echoPin) {
+
+  // TRIG 초기화
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(3);
+
+  // 10us 초음파 발사 신호
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  // ECHO HIGH 시간 측정
+  unsigned long duration =
+      pulseIn(echoPin, HIGH, 30000UL);
+
+  // 응답 없음
+  if (duration == 0) {
+    return -1.0f;
+  }
+
+  // 거리(cm)
+  float distance =
+      duration * 0.0343f / 2.0f;
+
+  return distance;
+}
+
+
+// ======================================================
+// 센서 4개 측정
+// ======================================================
 
 void measureAll() {
-  Serial.println("\n--- Distance test ---");
 
-  for (uint8_t i = 0; i < 4; ++i) {
-    // 센서 간 간섭을 줄이기 위해 순서대로 측정
-    delay(70);
+  Serial.println();
+  Serial.println("=================================");
+  Serial.println("      ULTRASONIC TEST");
+  Serial.println("=================================");
 
-    digitalWrite(TRIG_PIN[i], LOW);
-    delayMicroseconds(2);
-    digitalWrite(TRIG_PIN[i], HIGH);
-    delayMicroseconds(10);
-    digitalWrite(TRIG_PIN[i], LOW);
+  for (uint8_t i = 0; i < 4; i++) {
 
-    // 최대 30ms 동안 ECHO 응답 대기
-    unsigned long duration =
-        pulseIn(ECHO_PIN[i], HIGH, 30000UL);
+    // 센서끼리 초음파 간섭 방지
+    delay(80);
+
+    float cm =
+        readDistance(TRIG_PIN[i], ECHO_PIN[i]);
 
     Serial.print("Sensor ");
     Serial.print(i + 1);
+
     Serial.print(" [TRIG=");
     Serial.print(TRIG_PIN[i]);
+
     Serial.print(", ECHO=");
     Serial.print(ECHO_PIN[i]);
-    Serial.print("]: ");
 
-    if (duration == 0) {
+    Serial.print("] : ");
+
+    if (cm < 0) {
+
       Serial.println("NO ECHO");
-      continue;
+
+    } else {
+
+      Serial.print(cm, 1);
+      Serial.print(" cm");
+
+      if (cm < 2.0f || cm > 400.0f) {
+        Serial.print(" [OUT OF RANGE]");
+      }
+
+      Serial.println();
     }
-
-    float cm = duration * 0.0343f / 2.0f;
-
-    Serial.print(cm, 1);
-    Serial.print(" cm");
-
-    if (cm < 2.0f || cm > 400.0f) {
-      Serial.print(" [OUT OF RANGE]");
-    }
-
-    Serial.println();
   }
 
+  Serial.println("=================================");
   Serial.println("Send r to measure again.");
 }
 
+
+// ======================================================
+// SETUP
+// ======================================================
+
 void setup() {
+
   Serial.begin(115200);
 
-  for (uint8_t i = 0; i < 4; ++i) {
-    // 모터 전원은 꺼 둔 상태로 시험
-    digitalWrite(STEP_PIN[i], LOW);
-    pinMode(STEP_PIN[i], OUTPUT);
+  // -------------------------
+  // 모터 핀 설정
+  // -------------------------
 
-    digitalWrite(DIR_PIN[i], LOW);
+  for (uint8_t i = 0; i < 4; i++) {
+
+    pinMode(STEP_PIN[i], OUTPUT);
     pinMode(DIR_PIN[i], OUTPUT);
 
-    digitalWrite(TRIG_PIN[i], LOW);
-    pinMode(TRIG_PIN[i], OUTPUT);
-
-    pinMode(ECHO_PIN[i], INPUT);
+    // 현재 테스트에서는 모터를 움직이지 않음
+    digitalWrite(STEP_PIN[i], LOW);
+    digitalWrite(DIR_PIN[i], LOW);
   }
+
+
+  // -------------------------
+  // 초음파 센서 핀 설정
+  // -------------------------
+
+  for (uint8_t i = 0; i < 4; i++) {
+
+    pinMode(TRIG_PIN[i], OUTPUT);
+    pinMode(ECHO_PIN[i], INPUT);
+
+    digitalWrite(TRIG_PIN[i], LOW);
+  }
+
 
   delay(500);
 
-  Serial.println("\nUltrasonic test: ECHO4=13, TRIG4=14");
-  Serial.println("Send r to read all 4 sensors.");
+  Serial.println();
+  Serial.println("=================================");
+  Serial.println(" ESP32 SENSOR TEST READY");
+  Serial.println("=================================");
+
+  Serial.println("Sensor1 : TRIG 14 / ECHO 13");
+  Serial.println("Sensor2 : TRIG 27 / ECHO 26");
+  Serial.println("Sensor3 : TRIG 25 / ECHO 33");
+  Serial.println("Sensor4 : TRIG 32 / ECHO 35");
+
+  Serial.println();
+  Serial.println("Motor1 : DIR 15 / PUL 2");
+  Serial.println("Motor2 : DIR 4  / PUL 16");
+  Serial.println("Motor3 : DIR 17 / PUL 5");
+  Serial.println("Motor4 : DIR 19 / PUL 21");
+
+  Serial.println();
+  Serial.println("Send r to measure all sensors.");
 }
 
+
+// ======================================================
+// LOOP
+// ======================================================
+
 void loop() {
+
   if (Serial.available()) {
+
     char command = Serial.read();
 
     if (command == 'r' || command == 'R') {
@@ -86,4 +200,4 @@ void loop() {
   }
 
   delay(1);
-}r
+}
