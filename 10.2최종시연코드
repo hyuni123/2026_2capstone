@@ -1,0 +1,1855 @@
+#include <Arduino.h>
+
+// =====================================================
+// SMART LADDER - FINAL MULTI LEG VERSION
+//
+// 사용 다리 : 1 / 3 / 4
+// LIMIT SWITCH 사용 안 함
+//
+// [초기]
+// 1. 전원 ON
+// 2. 3초 동안 모터 절대 움직이지 않음
+// 3. 각 초음파센서 10번 측정
+// 4. 10번 평균값 = 각 센서의 BASELINE
+//
+// [작동 조건]
+// 현재거리 - BASELINE >= 10mm
+//
+// 단, 한 번 측정으로 바로 움직이지 않음.
+//
+// 1/3/4 전체 센서를 3라운드 측정하고
+// 그중 2라운드 이상 멀어짐이 확인된 다리만 작동.
+//
+// 예)
+// LEG1 : 변화 없음
+// LEG3 : +30mm
+// LEG4 : +25mm
+//
+// -> LEG1 그대로
+// -> LEG3, LEG4 동시에 START
+//
+// [목표 연장]
+// LEG1 = 센서 증가량 + 20mm
+// LEG3 = 센서 증가량 + 37mm
+// LEG4 = 센서 증가량 + 21mm
+//
+// [연장 이후]
+// 목표거리까지 연장
+// -> 5초 정지
+// -> 실제 연장 STEP만큼 반대로 회전
+// -> 처음 위치 0mm로 수축
+// =====================================================
+
+
+// =====================================================
+// 모터 / 리드스크류 설정
+// =====================================================
+
+// T8 Lead = 2mm
+// 200step/rev
+// 1/8 microstep
+//
+// 200 * 8 / 2 = 800 pulse/mm
+
+const float PULSES_PER_MM = 800.0f;
+
+
+// =====================================================
+// 각 다리의 현재 바닥과의 공극
+// =====================================================
+
+const float LEG1_GAP_MM = 20.0f;   // 2.0cm
+const float LEG3_GAP_MM = 37.0f;   // 3.7cm
+const float LEG4_GAP_MM = 21.0f;   // 2.1cm
+
+
+// =====================================================
+// 초음파 감지 조건
+// =====================================================
+
+// 기준보다 10mm 이상 멀어져야 실제 변화 후보
+const float SENSOR_TRIGGER_MM = 10.0f;
+
+
+// 수축 후 다시 기준거리로 돌아왔다고 보는 범위
+const float CLEAR_MARGIN_MM = 6.0f;
+
+
+// 전체 센서를 3라운드 확인
+const int DETECTION_ROUNDS = 3;
+
+
+// 3라운드 중 2번 이상 멀어졌으면 인정
+const int MIN_DETECTION_HITS = 2;
+
+
+// 수축 후 기준거리 복귀도 3번 확인
+const int CLEAR_CONFIRM_ROUNDS = 3;
+
+
+// =====================================================
+// 최대 연장거리
+// =====================================================
+
+const float MAX_EXTENSION_MM = 70.0f;
+
+
+// =====================================================
+// 연장 완료 후 5초 정지
+// =====================================================
+
+const unsigned long HOLD_TIME_MS = 5000;
+
+
+// =====================================================
+// 초음파 측정 설정
+// =====================================================
+
+const unsigned long ECHO_TIMEOUT_US = 30000;
+
+
+// 전체 센서 검사 주기
+const unsigned long SENSOR_SCAN_INTERVAL_MS = 120;
+
+
+// BASELINE 저장 후 추가 안전 대기
+const unsigned long ARM_DELAY_AFTER_BASELINE_MS = 1000;
+
+
+// ★ 초음파센서 간섭 방지
+//
+// 센서1 측정
+// -> 65ms
+// -> 센서3
+// -> 65ms
+// -> 센서4
+//
+// 방식
+const unsigned long INTER_SENSOR_GAP_MS = 65;
+
+
+// =====================================================
+// 모터 속도
+// =====================================================
+
+const unsigned long STEP_INTERVAL_US = 1400;
+
+const unsigned int STEP_HIGH_US = 5;
+
+
+// =====================================================
+// 다리 상태
+// =====================================================
+
+enum LegState
+{
+  IDLE,          // 대기
+  EXTENDING,     // 연장
+  HOLDING,       // 5초 정지
+  RETRACTING,    // 수축
+  WAIT_CLEAR     // 수축 후 센서 기준거리 복귀 대기
+};
+
+
+// =====================================================
+// 다리 구조체
+// =====================================================
+
+struct Leg
+{
+  int number;
+
+  int dirPin;
+  int stepPin;
+
+  int trigPin;
+  int echoPin;
+
+  int extendDir;
+
+  // 다리별 바닥 공극
+  float gapMm;
+
+  // 초음파 초기 10회 평균
+  float baselineMm;
+
+  // 목표 연장거리
+  float targetMm;
+
+  // 목표 STEP
+  long targetPulses;
+
+  // 실제 현재 STEP 위치
+  long currentPulses;
+
+  // 상태
+  LegState state;
+
+  // 다음 STEP 출력시간
+  unsigned long nextStepUs;
+
+  // 5초 HOLD 시작시간
+  unsigned long holdStartMs;
+
+  // 수축 후 센서 복귀 확인
+  int clearConfirmCount;
+};
+
+
+// =====================================================
+// 다리 개수
+// =====================================================
+
+const int LEG_COUNT = 3;
+
+
+// =====================================================
+// GPIO 배선
+// =====================================================
+//
+// LEG 1
+//
+// DIR  = GPIO15
+// STEP = GPIO2
+//
+// TRIG = GPIO14
+// ECHO = GPIO13
+//
+//
+// LEG 3
+//
+// DIR  = GPIO17
+// STEP = GPIO5
+//
+// TRIG = GPIO25
+// ECHO = GPIO33
+//
+//
+// LEG 4
+//
+// DIR  = GPIO19
+// STEP = GPIO21
+//
+// TRIG = GPIO32
+// ECHO = GPIO35
+// =====================================================
+
+Leg legs[LEG_COUNT] =
+{
+  {
+    1,
+
+    15,
+    2,
+
+    14,
+    13,
+
+    HIGH,
+
+    LEG1_GAP_MM,
+
+    0.0f,
+
+    0.0f,
+
+    0,
+
+    0,
+
+    IDLE,
+
+    0,
+
+    0,
+
+    0
+  },
+
+
+  {
+    3,
+
+    17,
+    5,
+
+    25,
+    33,
+
+    HIGH,
+
+    LEG3_GAP_MM,
+
+    0.0f,
+
+    0.0f,
+
+    0,
+
+    0,
+
+    IDLE,
+
+    0,
+
+    0,
+
+    0
+  },
+
+
+  {
+    4,
+
+    19,
+    21,
+
+    32,
+    35,
+
+    HIGH,
+
+    LEG4_GAP_MM,
+
+    0.0f,
+
+    0.0f,
+
+    0,
+
+    0,
+
+    IDLE,
+
+    0,
+
+    0,
+
+    0
+  }
+};
+
+
+// =====================================================
+// 전역 변수
+// =====================================================
+
+unsigned long lastSensorScanMs = 0;
+
+unsigned long armReadyMs = 0;
+
+
+// =====================================================
+// 동시감지용 Window
+// =====================================================
+
+bool detectionWindowActive = false;
+
+int detectionRound = 0;
+
+
+// 각 다리가 3번 중 몇 번 멀어졌는지
+int detectionHits[LEG_COUNT] =
+{
+  0,
+  0,
+  0
+};
+
+
+// 감지된 증가거리의 합
+float detectionIncreaseSum[LEG_COUNT] =
+{
+  0.0f,
+  0.0f,
+  0.0f
+};
+
+
+// =====================================================
+// STEP 1개
+// =====================================================
+
+void oneStep(Leg &leg)
+{
+  digitalWrite(
+    leg.stepPin,
+    HIGH
+  );
+
+
+  delayMicroseconds(
+    STEP_HIGH_US
+  );
+
+
+  digitalWrite(
+    leg.stepPin,
+    LOW
+  );
+}
+
+
+// =====================================================
+// 초음파센서 1번 측정
+// =====================================================
+
+float readDistanceOnceMm(Leg &leg)
+{
+  digitalWrite(
+    leg.trigPin,
+    LOW
+  );
+
+  delayMicroseconds(3);
+
+
+  digitalWrite(
+    leg.trigPin,
+    HIGH
+  );
+
+  delayMicroseconds(10);
+
+
+  digitalWrite(
+    leg.trigPin,
+    LOW
+  );
+
+
+  unsigned long duration =
+    pulseIn(
+      leg.echoPin,
+      HIGH,
+      ECHO_TIMEOUT_US
+    );
+
+
+  if (duration == 0)
+  {
+    return -1.0f;
+  }
+
+
+  float distanceMm =
+    duration *
+    0.343f /
+    2.0f;
+
+
+  if (
+    distanceMm < 10.0f ||
+    distanceMm > 1000.0f
+  )
+  {
+    return -1.0f;
+  }
+
+
+  return distanceMm;
+}
+
+
+// =====================================================
+// 현재 거리
+//
+// 3회 측정 후 중앙값 사용
+// =====================================================
+
+float readMedian3Mm(Leg &leg)
+{
+  float values[3];
+
+  int count = 0;
+
+
+  for (int i = 0; i < 3; i++)
+  {
+    float d =
+      readDistanceOnceMm(
+        leg
+      );
+
+
+    if (d > 0)
+    {
+      values[count] =
+        d;
+
+      count++;
+    }
+
+
+    delay(25);
+  }
+
+
+  if (count < 2)
+  {
+    return -1.0f;
+  }
+
+
+  // 정렬
+  for (int i = 0; i < count - 1; i++)
+  {
+    for (int j = i + 1; j < count; j++)
+    {
+      if (
+        values[j] <
+        values[i]
+      )
+      {
+        float temp =
+          values[i];
+
+        values[i] =
+          values[j];
+
+        values[j] =
+          temp;
+      }
+    }
+  }
+
+
+  return
+    values[count / 2];
+}
+
+
+// =====================================================
+// ★ 초기 기준거리
+//
+// 정상값 정확히 10개 측정 후 평균
+// =====================================================
+
+float measureInitialAverage10(Leg &leg)
+{
+  float sum = 0.0f;
+
+  int count = 0;
+
+
+  Serial.println();
+
+  Serial.print("LEG ");
+  Serial.print(leg.number);
+
+  Serial.println(
+    " INITIAL CALIBRATION"
+  );
+
+
+  while (count < 10)
+  {
+    float d =
+      readDistanceOnceMm(
+        leg
+      );
+
+
+    if (d > 0)
+    {
+      sum += d;
+
+      count++;
+
+
+      Serial.print("  ");
+
+      Serial.print(count);
+
+      Serial.print("/10 = ");
+
+      Serial.print(d, 1);
+
+      Serial.println("mm");
+    }
+
+
+    delay(60);
+  }
+
+
+  float average =
+    sum /
+    10.0f;
+
+
+  Serial.print("LEG ");
+  Serial.print(leg.number);
+
+  Serial.print(" BASELINE = ");
+
+  Serial.print(
+    average,
+    1
+  );
+
+  Serial.println("mm");
+
+
+  return average;
+}
+
+
+// =====================================================
+// 연장 시작
+// =====================================================
+
+void startExtension(
+  Leg &leg,
+  float targetMm
+)
+{
+  if (
+    targetMm >
+    MAX_EXTENSION_MM
+  )
+  {
+    targetMm =
+      MAX_EXTENSION_MM;
+  }
+
+
+  leg.targetMm =
+    targetMm;
+
+
+  leg.targetPulses =
+    (long)(
+      targetMm *
+      PULSES_PER_MM
+    );
+
+
+  // 처음 위치에서 출발
+  leg.currentPulses =
+    0;
+
+
+  // 연장 방향
+  digitalWrite(
+    leg.dirPin,
+    leg.extendDir
+  );
+
+
+  leg.state =
+    EXTENDING;
+
+
+  leg.nextStepUs =
+    micros();
+
+
+  Serial.println();
+
+  Serial.print(
+    ">>> LEG "
+  );
+
+  Serial.print(
+    leg.number
+  );
+
+  Serial.print(
+    " START | TARGET="
+  );
+
+  Serial.print(
+    targetMm,
+    1
+  );
+
+  Serial.println(
+    "mm"
+  );
+}
+
+
+// =====================================================
+// 연장 완료
+// =====================================================
+
+void finishExtension(
+  Leg &leg
+)
+{
+  digitalWrite(
+    leg.stepPin,
+    LOW
+  );
+
+
+  leg.state =
+    HOLDING;
+
+
+  leg.holdStartMs =
+    millis();
+
+
+  Serial.println();
+
+  Serial.print(
+    ">>> LEG "
+  );
+
+  Serial.print(
+    leg.number
+  );
+
+  Serial.print(
+    " EXTENSION COMPLETE = "
+  );
+
+  Serial.print(
+    (float)leg.currentPulses /
+    PULSES_PER_MM,
+    1
+  );
+
+  Serial.println(
+    "mm"
+  );
+
+
+  Serial.println(
+    ">>> HOLD 5 SEC"
+  );
+}
+
+
+// =====================================================
+// 수축 시작
+// =====================================================
+
+void startRetraction(
+  Leg &leg
+)
+{
+  int retractDir =
+    (leg.extendDir == HIGH)
+    ? LOW
+    : HIGH;
+
+
+  digitalWrite(
+    leg.dirPin,
+    retractDir
+  );
+
+
+  leg.state =
+    RETRACTING;
+
+
+  leg.nextStepUs =
+    micros();
+
+
+  Serial.println();
+
+  Serial.print(
+    "<<< LEG "
+  );
+
+  Serial.print(
+    leg.number
+  );
+
+  Serial.println(
+    " RETRACT START"
+  );
+}
+
+
+// =====================================================
+// 수축 완료
+// =====================================================
+
+void finishRetraction(
+  Leg &leg
+)
+{
+  digitalWrite(
+    leg.stepPin,
+    LOW
+  );
+
+
+  leg.currentPulses =
+    0;
+
+
+  leg.targetPulses =
+    0;
+
+
+  leg.targetMm =
+    0.0f;
+
+
+  leg.clearConfirmCount =
+    0;
+
+
+  // 바로 다시 연장하지 않도록
+  // 센서가 기준거리로 돌아올 때까지 기다림
+  leg.state =
+    WAIT_CLEAR;
+
+
+  Serial.println();
+
+  Serial.print(
+    "<<< LEG "
+  );
+
+  Serial.print(
+    leg.number
+  );
+
+  Serial.println(
+    " RETRACT COMPLETE -> 0mm"
+  );
+}
+
+
+// =====================================================
+// 모터 상태 처리
+//
+// 핵심:
+//
+// while문 없음.
+//
+// LOOP가:
+//
+// LEG1
+// LEG3
+// LEG4
+//
+// 계속 빠르게 번갈아 STEP을 보냄.
+//
+// 따라서 여러 모터 동시 회전.
+// =====================================================
+
+void serviceLeg(Leg &leg)
+{
+  // =================================================
+  // 연장
+  // =====================================================
+
+  if (
+    leg.state ==
+    EXTENDING
+  )
+  {
+    if (
+      leg.currentPulses >=
+      leg.targetPulses
+    )
+    {
+      finishExtension(
+        leg
+      );
+
+      return;
+    }
+
+
+    unsigned long now =
+      micros();
+
+
+    if (
+      (long)(
+        now -
+        leg.nextStepUs
+      ) >= 0
+    )
+    {
+      oneStep(
+        leg
+      );
+
+
+      leg.currentPulses++;
+
+
+      leg.nextStepUs =
+        now +
+        STEP_INTERVAL_US;
+    }
+
+
+    return;
+  }
+
+
+  // =================================================
+  // 5초 정지
+  // =====================================================
+
+  if (
+    leg.state ==
+    HOLDING
+  )
+  {
+    if (
+      millis() -
+      leg.holdStartMs
+      >=
+      HOLD_TIME_MS
+    )
+    {
+      startRetraction(
+        leg
+      );
+    }
+
+
+    return;
+  }
+
+
+  // =================================================
+  // 수축
+  // =====================================================
+
+  if (
+    leg.state ==
+    RETRACTING
+  )
+  {
+    if (
+      leg.currentPulses <=
+      0
+    )
+    {
+      finishRetraction(
+        leg
+      );
+
+      return;
+    }
+
+
+    unsigned long now =
+      micros();
+
+
+    if (
+      (long)(
+        now -
+        leg.nextStepUs
+      ) >= 0
+    )
+    {
+      oneStep(
+        leg
+      );
+
+
+      leg.currentPulses--;
+
+
+      leg.nextStepUs =
+        now +
+        STEP_INTERVAL_US;
+    }
+
+
+    return;
+  }
+}
+
+
+// =====================================================
+// 현재 동작 중인가?
+// =====================================================
+
+bool anyBusy()
+{
+  for (int i = 0; i < LEG_COUNT; i++)
+  {
+    if (
+      legs[i].state == EXTENDING ||
+      legs[i].state == HOLDING ||
+      legs[i].state == RETRACTING
+    )
+    {
+      return true;
+    }
+  }
+
+
+  return false;
+}
+
+
+// =====================================================
+// 감지 Window 초기화
+// =====================================================
+
+void resetDetectionWindow()
+{
+  detectionWindowActive =
+    false;
+
+
+  detectionRound =
+    0;
+
+
+  for (int i = 0; i < LEG_COUNT; i++)
+  {
+    detectionHits[i] =
+      0;
+
+
+    detectionIncreaseSum[i] =
+      0.0f;
+  }
+}
+
+
+// =====================================================
+// ★★★ 전체 센서 검사 ★★★
+//
+// 중요:
+//
+// 모터를 절대 먼저 출발시키지 않음.
+//
+// 센서1
+// 센서3
+// 센서4
+//
+// 모두 측정
+//
+// ↓
+//
+// 3라운드까지 반복
+//
+// ↓
+//
+// 각 다리 독립 판단
+//
+// ↓
+//
+// 조건을 만족한 모든 다리를
+// 같은 순간에 EXTENDING 상태로 변경
+// =====================================================
+
+void scanAllLegs()
+{
+  float nowMm[LEG_COUNT] =
+  {
+    -1.0f,
+    -1.0f,
+    -1.0f
+  };
+
+
+  float increase[LEG_COUNT] =
+  {
+    0.0f,
+    0.0f,
+    0.0f
+  };
+
+
+  // =================================================
+  // STEP 1
+  //
+  // ★ 센서 전부 먼저 읽음
+  //
+  // 각 센서 사이 65ms 쉬어서
+  // 초음파 간섭 감소
+  // =====================================================
+
+  for (int i = 0; i < LEG_COUNT; i++)
+  {
+    if (
+      legs[i].state == IDLE ||
+      legs[i].state == WAIT_CLEAR
+    )
+    {
+      nowMm[i] =
+        readMedian3Mm(
+          legs[i]
+        );
+
+
+      delay(
+        INTER_SENSOR_GAP_MS
+      );
+    }
+  }
+
+
+  // =================================================
+  // 수축 완료된 다리 재활성화
+  // =====================================================
+
+  for (int i = 0; i < LEG_COUNT; i++)
+  {
+    Leg &leg =
+      legs[i];
+
+
+    if (
+      leg.state !=
+      WAIT_CLEAR
+    )
+    {
+      continue;
+    }
+
+
+    if (
+      nowMm[i] <
+      0
+    )
+    {
+      continue;
+    }
+
+
+    float difference =
+      fabs(
+        nowMm[i] -
+        leg.baselineMm
+      );
+
+
+    if (
+      difference <=
+      CLEAR_MARGIN_MM
+    )
+    {
+      leg.clearConfirmCount++;
+
+
+      if (
+        leg.clearConfirmCount >=
+        CLEAR_CONFIRM_ROUNDS
+      )
+      {
+        leg.state =
+          IDLE;
+
+
+        leg.clearConfirmCount =
+          0;
+
+
+        Serial.print(
+          "LEG "
+        );
+
+        Serial.print(
+          leg.number
+        );
+
+        Serial.println(
+          " RE-ARMED"
+        );
+      }
+    }
+
+    else
+    {
+      leg.clearConfirmCount =
+        0;
+    }
+  }
+
+
+  // =================================================
+  // IDLE 다리들의 증가거리
+  // =====================================================
+
+  bool anyFar =
+    false;
+
+
+  for (int i = 0; i < LEG_COUNT; i++)
+  {
+    Leg &leg =
+      legs[i];
+
+
+    if (
+      leg.state !=
+      IDLE
+    )
+    {
+      continue;
+    }
+
+
+    if (
+      nowMm[i] <
+      0
+    )
+    {
+      continue;
+    }
+
+
+    increase[i] =
+      nowMm[i] -
+      leg.baselineMm;
+
+
+    Serial.print(
+      "LEG "
+    );
+
+    Serial.print(
+      leg.number
+    );
+
+
+    Serial.print(
+      " BASE="
+    );
+
+    Serial.print(
+      leg.baselineMm,
+      1
+    );
+
+
+    Serial.print(
+      " NOW="
+    );
+
+    Serial.print(
+      nowMm[i],
+      1
+    );
+
+
+    Serial.print(
+      " INC="
+    );
+
+    Serial.println(
+      increase[i],
+      1
+    );
+
+
+    if (
+      increase[i] >=
+      SENSOR_TRIGGER_MM
+    )
+    {
+      anyFar =
+        true;
+    }
+  }
+
+
+  // =================================================
+  // 아무 센서도 멀어지지 않음
+  //
+  // ★ 모터 아무것도 하지 않음
+  // =====================================================
+
+  if (
+    !detectionWindowActive
+  )
+  {
+    if (
+      !anyFar
+    )
+    {
+      return;
+    }
+
+
+    // 하나라도 실제 변화가 생겼으면
+    // 3라운드 동시판정 시작
+
+    detectionWindowActive =
+      true;
+
+
+    detectionRound =
+      0;
+
+
+    for (int i = 0; i < LEG_COUNT; i++)
+    {
+      detectionHits[i] =
+        0;
+
+
+      detectionIncreaseSum[i] =
+        0.0f;
+    }
+  }
+
+
+  // =================================================
+  // 이번 라운드 기록
+  // =====================================================
+
+  detectionRound++;
+
+
+  for (int i = 0; i < LEG_COUNT; i++)
+  {
+    Leg &leg =
+      legs[i];
+
+
+    if (
+      leg.state !=
+      IDLE
+    )
+    {
+      continue;
+    }
+
+
+    if (
+      nowMm[i] <
+      0
+    )
+    {
+      continue;
+    }
+
+
+    if (
+      increase[i] >=
+      SENSOR_TRIGGER_MM
+    )
+    {
+      detectionHits[i]++;
+
+
+      detectionIncreaseSum[i] +=
+        increase[i];
+    }
+  }
+
+
+  Serial.print(
+    "DETECT ROUND "
+  );
+
+  Serial.print(
+    detectionRound
+  );
+
+  Serial.print(
+    "/"
+  );
+
+  Serial.println(
+    DETECTION_ROUNDS
+  );
+
+
+  // 아직 3라운드 안 끝남
+  if (
+    detectionRound <
+    DETECTION_ROUNDS
+  )
+  {
+    return;
+  }
+
+
+  // =================================================
+  // ★ 3라운드 완료
+  //
+  // 여기서 처음으로
+  // 어떤 모터를 움직일지 결정
+  // =====================================================
+
+  bool startRequest[LEG_COUNT] =
+  {
+    false,
+    false,
+    false
+  };
+
+
+  float targetMm[LEG_COUNT] =
+  {
+    0.0f,
+    0.0f,
+    0.0f
+  };
+
+
+  int startCount =
+    0;
+
+
+  for (int i = 0; i < LEG_COUNT; i++)
+  {
+    Leg &leg =
+      legs[i];
+
+
+    if (
+      leg.state !=
+      IDLE
+    )
+    {
+      continue;
+    }
+
+
+    // =================================================
+    // 3번 중 최소 2번은
+    // 실제로 멀어진 값이어야 함
+    //
+    // 아니면 그 다리는 가만히 둠
+    // =====================================================
+
+    if (
+      detectionHits[i] <
+      MIN_DETECTION_HITS
+    )
+    {
+      Serial.print(
+        "LEG "
+      );
+
+      Serial.print(
+        leg.number
+      );
+
+      Serial.println(
+        " NOT DETECTED -> STAY"
+      );
+
+
+      continue;
+    }
+
+
+    // =================================================
+    // 해당 다리의 평균 증가량
+    // =====================================================
+
+    float averageIncrease =
+      detectionIncreaseSum[i] /
+      (float)detectionHits[i];
+
+
+    // =================================================
+    // 목표거리
+    //
+    // 1번 = 증가량 + 20mm
+    // 3번 = 증가량 + 37mm
+    // 4번 = 증가량 + 21mm
+    // =====================================================
+
+    float target =
+      averageIncrease +
+      leg.gapMm;
+
+
+    if (
+      target >
+      MAX_EXTENSION_MM
+    )
+    {
+      target =
+        MAX_EXTENSION_MM;
+    }
+
+
+    startRequest[i] =
+      true;
+
+
+    targetMm[i] =
+      target;
+
+
+    startCount++;
+
+
+    Serial.print(
+      "LEG "
+    );
+
+    Serial.print(
+      leg.number
+    );
+
+
+    Serial.print(
+      " DETECTED | AVG="
+    );
+
+    Serial.print(
+      averageIncrease,
+      1
+    );
+
+
+    Serial.print(
+      " + GAP="
+    );
+
+    Serial.print(
+      leg.gapMm,
+      1
+    );
+
+
+    Serial.print(
+      " -> TARGET="
+    );
+
+    Serial.print(
+      target,
+      1
+    );
+
+    Serial.println(
+      "mm"
+    );
+  }
+
+
+  // 감지창 초기화
+  resetDetectionWindow();
+
+
+  if (
+    startCount ==
+    0
+  )
+  {
+    return;
+  }
+
+
+  // =================================================
+  // ★★★★★ 중요 ★★★★★
+  //
+  // 모든 센서의 판단을 전부 끝낸 다음
+  // 여기서 한꺼번에 START.
+  //
+  // LEG3 O
+  // LEG4 O
+  //
+  // -> 둘 다 여기서 동시에 EXTENDING
+  // =====================================================
+
+  Serial.println();
+
+  Serial.print(
+    ">>> SIMULTANEOUS START COUNT = "
+  );
+
+  Serial.println(
+    startCount
+  );
+
+
+  for (int i = 0; i < LEG_COUNT; i++)
+  {
+    if (
+      startRequest[i]
+    )
+    {
+      startExtension(
+        legs[i],
+        targetMm[i]
+      );
+    }
+  }
+}
+
+
+// =====================================================
+// 초기 기준거리 저장
+// =====================================================
+
+void saveInitialBaselines()
+{
+  Serial.println();
+
+  Serial.println(
+    "===================================="
+  );
+
+  Serial.println(
+    " BASELINE CALIBRATION"
+  );
+
+  Serial.println(
+    " 10 READINGS AVERAGE"
+  );
+
+  Serial.println(
+    "===================================="
+  );
+
+
+  for (int i = 0; i < LEG_COUNT; i++)
+  {
+    Leg &leg =
+      legs[i];
+
+
+    leg.currentPulses =
+      0;
+
+
+    leg.targetPulses =
+      0;
+
+
+    leg.targetMm =
+      0.0f;
+
+
+    leg.state =
+      IDLE;
+
+
+    leg.clearConfirmCount =
+      0;
+
+
+    // ★ 10번 평균
+    leg.baselineMm =
+      measureInitialAverage10(
+        leg
+      );
+
+
+    // 센서 간 초음파 잔향 제거
+    delay(100);
+  }
+
+
+  resetDetectionWindow();
+
+
+  // BASELINE 저장 직후에도
+  // 1초 동안 감지 시작 안 함
+
+  armReadyMs =
+    millis() +
+    ARM_DELAY_AFTER_BASELINE_MS;
+
+
+  Serial.println();
+
+  Serial.println(
+    "===================================="
+  );
+
+  Serial.println(
+    " BASELINE SAVED"
+  );
+
+  Serial.println(
+    " ALL MOTORS = 0mm"
+  );
+
+  Serial.println(
+    " NO MOTOR MOVEMENT"
+  );
+
+  Serial.println(
+    " WAIT FOR REAL DISTANCE INCREASE"
+  );
+
+  Serial.println(
+    "===================================="
+  );
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(
+    115200
+  );
+
+
+  delay(1000);
+
+
+  for (int i = 0; i < LEG_COUNT; i++)
+  {
+    pinMode(
+      legs[i].dirPin,
+      OUTPUT
+    );
+
+
+    pinMode(
+      legs[i].stepPin,
+      OUTPUT
+    );
+
+
+    pinMode(
+      legs[i].trigPin,
+      OUTPUT
+    );
+
+
+    pinMode(
+      legs[i].echoPin,
+      INPUT
+    );
+
+
+    digitalWrite(
+      legs[i].stepPin,
+      LOW
+    );
+
+
+    digitalWrite(
+      legs[i].trigPin,
+      LOW
+    );
+  }
+
+
+  Serial.println();
+
+  Serial.println(
+    "===================================="
+  );
+
+  Serial.println(
+    " SMART LADDER FINAL"
+  );
+
+  Serial.println(
+    " LEG 1 / 3 / 4"
+  );
+
+  Serial.println(
+    "===================================="
+  );
+
+
+  Serial.println(
+    "WAIT 3 SEC"
+  );
+
+
+  Serial.println(
+    "MOTORS DO NOTHING"
+  );
+
+
+  // =================================================
+  // ★ 처음 3초 진짜 아무것도 안 함
+  // =====================================================
+
+  delay(3000);
+
+
+  // =================================================
+  // 3초 뒤에 10번 평균 기준거리 저장
+  // =====================================================
+
+  saveInitialBaselines();
+
+
+  lastSensorScanMs =
+    millis();
+}
+
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+  // =================================================
+  // 모터 3개를 계속 번갈아 처리
+  //
+  // 1 -> 3 -> 4 -> 1 -> 3 -> 4
+  //
+  // 따라서 둘 이상 동시에 회전 가능
+  // =====================================================
+
+  serviceLeg(
+    legs[0]
+  );
+
+
+  serviceLeg(
+    legs[1]
+  );
+
+
+  serviceLeg(
+    legs[2]
+  );
+
+
+  // =================================================
+  // 연장 / HOLD / 수축 중에는
+  // 새 동작 판정을 하지 않음
+  // =====================================================
+
+  if (
+    anyBusy()
+  )
+  {
+    return;
+  }
+
+
+  // BASELINE 저장 직후 안전대기
+  if (
+    (long)(
+      millis() -
+      armReadyMs
+    ) < 0
+  )
+  {
+    return;
+  }
+
+
+  // =================================================
+  // 센서 검사
+  // =====================================================
+
+  if (
+    millis() -
+    lastSensorScanMs
+    >=
+    SENSOR_SCAN_INTERVAL_MS
+  )
+  {
+    lastSensorScanMs =
+      millis();
+
+
+    scanAllLegs();
+  }
+}
